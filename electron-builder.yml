@@ -1,0 +1,23 @@
+appId: com.workreport.daily
+productName: 工作日报
+directories:
+  buildResources: build
+  output: dist
+files:
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!electron.vite.config.*'
+  - '!{.eslintignore,.eslintrc.cjs,.prettierignore,.prettierrc.yaml}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  - '!{DESIGN.md,README.md}'
+win:
+  target:
+    - nsis
+  artifactName: ${name}-${version}-setup.${ext}
+nsis:
+  artifactName: ${name}-${version}-setup.${ext}
+  shortcutName: 工作日报
+  uninstallDisplayName: 工作日报
+  createDesktopShortcut: always
+  oneClick: false
+  allowToChangeInstallationDirectory: true
