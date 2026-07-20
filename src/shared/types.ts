@@ -107,6 +107,8 @@ export interface ReportOverview {
   issuesUnsolvedCount: number
   // 详细 Token 仪表盘数据（本地计算，非 AI 生成）
   tokenDashboard?: TokenDashboard
+  // 用户手动补充的工作内容（保存供后续参考）
+  manualInput?: ManualInput
 }
 
 export interface TokenDashboard {
@@ -118,6 +120,12 @@ export interface TokenDashboard {
   avgCostPerRound: number           // 平均每轮费用
   totalRounds: number               // 总会话轮数（去重后）
   balance?: string                  // 账户余额
+}
+
+// ==================== 用户手动输入 ====================
+export interface ManualInput {
+  text: string           // 用户手动输入的工作内容描述
+  images: string[]       // 图片的 base64 data URI 数组 (data:image/...)
 }
 
 export interface ProjectReport {
@@ -289,6 +297,10 @@ export const IPC_CHANNELS = {
 
   // 飞书导出
   EXPORT_FEISHU: 'export-feishu',
+  EXPORT_FEISHU_BITABLE: 'export-feishu-bitable',
+
+  // 工作片段 (甘特图)
+  GET_WORK_SNIPPETS: 'get-work-snippets',
 
   // 文件监控
   START_WATCHER: 'start-watcher',

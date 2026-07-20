@@ -1,5 +1,5 @@
-import { useState, useCallback, useEffect } from 'react'
-import { Layout, Menu, Button, Message, InputNumber, Tooltip } from '@arco-design/web-react'
+import { useState, useCallback, useEffect, useRef } from 'react'
+import { Layout, Menu, Button, Message, InputNumber, Tooltip, DatePicker } from '@arco-design/web-react'
 import {
   IconApps,
   IconHistory,
@@ -11,9 +11,12 @@ import ReportPreview from './components/ReportPreview'
 import AddProjectPage from './components/AddProjectPage'
 import HistoryPage from './components/HistoryPage'
 import SettingsPage from './components/SettingsPage'
+import ManualInput from './components/ManualInput'
+import type { ManualInput as ManualInputType } from '../shared/types'
 import './styles/global.css'
 
 const { Sider, Content } = Layout
+const { RangePicker } = DatePicker
 
 // 从配置中持久化追踪项目 ID（存储 key）
 const TRACKED_IDS_KEY = 'trackedProjectIds'
@@ -28,6 +31,12 @@ export default function App() {
   const [progressLog, setProgressLog] = useState<string[]>([])
   // 摘要分割轮数
   const [chunkSize, setChunkSize] = useState(100)
+  // 手动补充工作内容
+  const [manualInput, setManualInput] = useState<ManualInputType>({ text: '', images: [] })
+  // 日期范围：默认今天（凌晨5点起），可手动选择多日
+  const todayStr = new Date().toISOString().slice(0, 10)
+  const [dateRange, setDateRange] = useState<[string, string]>([todayStr, todayStr])
+  const cancelRef = useRef(false)
 
   // 启动时从 config 恢复追踪列表
   useEffect(() => {
@@ -61,12 +70,21 @@ export default function App() {
   }, [])
 
   const handleGenerate = async () => {
+    // 如果正在生成中，第二次点击 → 中断
+    if (generating) {
+      cancelRef.current = true
+      window.electronAPI.invoke('cancel-generate').catch(() => {})
+      Message.info({ content: '⏹ 正在中断日报生成...', id: 'gen-cancel' })
+      return
+    }
+
     const ids = [...trackedIds]
     if (ids.length === 0) {
       Message.warning('请先在左侧勾选要追踪的项目')
       return
     }
 
+    cancelRef.current = false
     setGenerating(true)
     setProgressLog([])
 
@@ -83,7 +101,9 @@ export default function App() {
 
     try {
       for (const id of ids) {
-        const result = await window.electronAPI.invoke('generate-report', id, chunkSize)
+        if (cancelRef.current) break // 用户中断
+        const result = await window.electronAPI.invoke('generate-report', id, chunkSize, manualInput, dateRange)
+        if (cancelRef.current) break // 用户中断（IPC 返回后）
         if (result.errors && result.errors.length > 0) {
           allErrors.push(...result.errors)
         }
@@ -92,19 +112,27 @@ export default function App() {
         }
       }
 
-      if (allErrors.length > 0) {
+      if (cancelRef.current) {
+        Message.info({ content: '⏹ 日报生成已中断', id: 'gen-cancel' })
+      } else if (allErrors.length > 0) {
         Message.error({ content: `生成失败：${allErrors[0]}`, duration: 6000 })
       } else if (successCount > 0) {
         Message.success({ content: `✅ 已为 ${successCount} 个项目生成日报` })
+        setManualInput({ text: '', images: [] })
       } else {
         Message.warning({ content: '日报生成完成，但无有效结果' })
       }
     } catch (err) {
-      Message.error({ content: `生成失败: ${String(err)}`, duration: 6000 })
+      if (!cancelRef.current) {
+        Message.error({ content: `生成失败: ${String(err)}`, duration: 6000 })
+      }
     } finally {
       unsub()
+      cancelRef.current = false
       setGenerating(false)
-      setReportRefreshKey(k => k + 1)  // 强制日报预览重新加载
+      if (!cancelRef.current || successCount > 0) {
+        setReportRefreshKey(k => k + 1) // 强制日报预览重新加载
+      }
     }
   }
 
@@ -121,6 +149,36 @@ export default function App() {
       }
     } catch (err) {
       Message.error({ content: `导出失败: ${String(err)}`, id: 'export', duration: 5000 })
+    }
+  }
+
+  const handleExportGantt = async () => {
+    const ids = [...trackedIds]
+    if (ids.length === 0) {
+      Message.warning('请先在左侧勾选要追踪的项目')
+      return
+    }
+    const today = new Date().toISOString().slice(0, 10)
+    Message.loading({ content: '正在导出甘特图到飞书多维表格...', id: 'export-gantt' })
+    try {
+      let successCount = 0
+      for (const id of ids) {
+        const result = await window.electronAPI.invoke('export-feishu-bitable', id, today)
+        if (result.success) {
+          successCount++
+          if (result.url) {
+            window.electronAPI.invoke('open-external', result.url)
+          }
+        } else if (result.error) {
+          Message.error({ content: `导出甘特图失败: ${result.error}`, id: 'export-gantt', duration: 6000 })
+          return
+        }
+      }
+      if (successCount > 0) {
+        Message.success({ content: `✅ 已导出 ${successCount} 个项目的甘特图到飞书`, id: 'export-gantt' })
+      }
+    } catch (err) {
+      Message.error({ content: `导出失败: ${String(err)}`, id: 'export-gantt', duration: 5000 })
     }
   }
 
@@ -226,6 +284,18 @@ export default function App() {
                 })}
               </h2>
               <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+                <Tooltip content="选择对话扫描日期范围。默认仅扫描今天凌晨5点至今的对话；可选择更早的起始日期来汇总多日工作">
+                  <RangePicker
+                    value={dateRange}
+                    onChange={(v: any) => {
+                      if (v && v.length === 2) {
+                        setDateRange([String(v[0] || todayStr), String(v[1] || todayStr)])
+                      }
+                    }}
+                    style={{ width: 240 }}
+                    disabled={generating}
+                  />
+                </Tooltip>
                 <Tooltip content="摘要切分粒度：每 N 轮对话生成一段摘要。值越小日报越详细但越慢，值越大越快但越概括">
                   <InputNumber
                     value={chunkSize}
@@ -238,11 +308,19 @@ export default function App() {
                     disabled={generating}
                   />
                 </Tooltip>
-                <Button type="primary" size="large" onClick={handleGenerate}>
-                  🔄 一键生成日报
+                <Button
+                  type="primary"
+                  size="large"
+                  onClick={handleGenerate}
+                  status={generating ? 'danger' : undefined}
+                >
+                  {generating ? '⏹ 中断生成' : '🔄 一键生成日报'}
                 </Button>
                 <Button type="outline" size="large" onClick={handleExport}>
                   📤 导出飞书
+                </Button>
+                <Button type="outline" size="large" onClick={handleExportGantt}>
+                  📊 导出甘特图
                 </Button>
               </div>
             </div>
@@ -250,6 +328,15 @@ export default function App() {
 
           {selectedMenu !== 'today' && (
             <h2 style={{ marginBottom: 24 }}>{getPageTitle()}</h2>
+          )}
+
+          {/* 手动补充工作内容 */}
+          {selectedMenu === 'today' && (
+            <ManualInput
+              value={manualInput}
+              onChange={setManualInput}
+              disabled={generating}
+            />
           )}
 
           {/* 生成进度面板 */}

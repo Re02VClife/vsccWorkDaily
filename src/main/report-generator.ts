@@ -13,7 +13,8 @@ import type {
   CodeChange,
   DailyReport,
   ReportContent,
-  EditFeedback
+  EditFeedback,
+  ManualInput
 } from '../shared/types'
 
 /**
@@ -35,7 +36,10 @@ function getWorkDate(now: Date = new Date()): string {
 export async function generateReport(
   projectId?: number,
   onProgress?: (msg: string) => void,
-  chunkSize: number = 100
+  chunkSize: number = 100,
+  manualInput?: ManualInput,
+  dateRange?: [string, string],
+  isCancelled?: () => boolean
 ): Promise<{ reports: DailyReport[]; errors: string[] }> {
   const progress = (msg: string) => {
     console.log('[report-gen]', msg)
@@ -45,6 +49,7 @@ export async function generateReport(
   const config = loadConfig()
   const today = getWorkDate()
   const errors: string[] = []
+  const checkCancel = () => isCancelled?.()
 
   // 检查 API Key
   if (!config.apiKey && !process.env.ANTHROPIC_API_KEY) {
@@ -64,14 +69,27 @@ export async function generateReport(
     projects = rows.map(rowToProject)
   }
 
-  // 扫描最近 7 天的 JSONL 会话（不只今天）
-  const todayStart = new Date(`${today}T00:00:00`)
-  const weekAgo = new Date(todayStart.getTime() - 7 * 86400000)
-  progress('🔍 正在扫描 Claude Code 对话记录...')
-  const recentSessions = await scanRecentSessions(weekAgo)
+  // 确定扫描日期范围
+  // dateRange[0] = 起始日期, dateRange[1] = 结束日期
+  // 默认：今天凌晨 workdayStartHour 点到当前时间
+  const startDate = dateRange?.[0] || today
+  const endDate = dateRange?.[1] || today
+  const wh = config.workdayStartHour || 5
+  const since = new Date(`${startDate}T${String(wh).padStart(2, '0')}:00:00`)
+  const now = new Date()
+  // 如果结束日期是今天，截止到当前时间；否则截止到那天 23:59:59
+  const until = endDate === today
+    ? now
+    : new Date(`${endDate}T23:59:59`)
 
-  progress(`📂 找到 ${recentSessions.length} 个最近会话文件`)
-  console.log(`[report-gen] 找到 ${recentSessions.length} 个最近会话文件`)
+  progress(`🔍 正在扫描 Claude Code 对话记录（${startDate} ${String(wh).padStart(2, '0')}:00 ~ ${endDate === today ? '现在' : endDate + ' 23:59'}）...`)
+  // 扫描起点稍早一天防止时区/文件时间偏差
+  const scanSince = new Date(since.getTime() - 86400000)
+  const recentSessions = (await scanRecentSessions(scanSince))
+    .filter(s => s.mtime >= since && s.mtime <= until)
+
+  progress(`📂 找到 ${recentSessions.length} 个会话文件（${startDate} ~ ${endDate}）`)
+  console.log(`[report-gen] 找到 ${recentSessions.length} 个会话文件`)
 
   // 按项目匹配会话
   const projectSessions = new Map<number, typeof recentSessions>()
@@ -87,6 +105,10 @@ export async function generateReport(
   const reports: DailyReport[] = []
 
   for (const project of projects) {
+    if (checkCancel?.()) {
+      progress('⏹ 用户中断，跳过剩余项目')
+      break
+    }
     try {
       progress(`\n📋 正在处理项目: ${project.name}`)
 
@@ -245,6 +267,10 @@ export async function generateReport(
         timeRange: string; topic: string; roundCount: number
         inputTokens: number; cacheHit: number; outputTokens: number; cacheHitRate: number; costRmb: number
       }> = []
+      // 收集会话元数据用于事后生成甘特图片段
+      const sessionMetas: Array<{
+        sessionId: string; startTime: string; endTime: string; topic: string; conclusion: string
+      }> = []
 
       for (const sessionFile of matched) {
         const entries = parseJsonlFile(sessionFile.filePath)
@@ -293,6 +319,14 @@ export async function generateReport(
           cacheHitRate: hitRate,
           costRmb: Math.round(sCost * 100) / 100
         })
+        // 收集会话元数据供甘特图片段生成
+        sessionMetas.push({
+          sessionId: meta.sessionId,
+          startTime: meta.startTime || '',
+          endTime: meta.endTime || '',
+          topic: topic.substring(0, 60),
+          conclusion: firstSummary?.match(/结论: (.+)/)?.[1] || topic.substring(0, 60)
+        })
       }
 
       const cacheMiss = totalInput
@@ -321,19 +355,29 @@ export async function generateReport(
       }, null, 2)
 
       // 8. 调用 AI 生成日报
+      if (checkCancel?.()) {
+        progress('⏹ 用户中断，跳过 AI 调用')
+        continue
+      }
       progress(`  🧠 正在调用 AI 生成日报...（可能需要 30-60 秒）`)
       const reportContent = await generateDailyReport(
         projectContext,
         conversationSummaries || '(今日无 AI 对话)',
         codeChangesText.join('\n') || '(今日无代码变更)',
         editFeedback,
-        precomputedData // 传入预计算数据（对话 + Token 指标）
+        precomputedData, // 传入预计算数据（对话 + Token 指标）
+        manualInput
       )
 
       // 9. 用本地计算的准确 Token 数据覆盖 AI 生成的部分
       // AI 擅长定性分析（进展、问题、方案），不擅长精确的数字统计
       const totalRounds = perSessionTokens.reduce((s, x) => s + x.roundCount, 0)
       const modelUsed = sessionModel
+
+      // 保存手动输入到日报中
+      if (manualInput && reportContent.overview) {
+        reportContent.overview.manualInput = manualInput
+      }
 
       // 安全注入 — 确保 AI 返回了必要的结构
       if (reportContent.overview) {
@@ -423,6 +467,13 @@ export async function generateReport(
       }
 
       reports.push(report)
+
+      // 10. 生成甘特图工作片段
+      try {
+        generateWorkSnippets(project, today, sessionMetas, codeChanges, reportContent)
+      } catch (snippetErr) {
+        console.error('生成工作片段失败:', snippetErr)
+      }
     } catch (err) {
       const msg = `项目 ${project.name} 日报生成失败: ${err}`
       console.error(msg)
@@ -431,6 +482,114 @@ export async function generateReport(
   }
 
   return { reports, errors }
+}
+
+/**
+ * 根据日报数据自动生成 WorkSnippet 工作片段（甘特图行数据）
+ */
+function generateWorkSnippets(
+  project: ProjectConfig,
+  today: string,
+  sessionMetas: Array<{ sessionId: string; startTime: string; endTime: string; topic: string; conclusion: string }>,
+  codeChanges: CodeChange[],
+  reportContent: ReportContent
+): void {
+  const db = getDatabase()
+  // 清除今天的已有片段
+  db.prepare('DELETE FROM work_snippets WHERE project_id = ? AND date = ?').run(project.id, today)
+
+  const insertStmt = db.prepare(`
+    INSERT INTO work_snippets (project_id, date, snippet_type, title, description, start_time, end_time, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+
+  // 1. AI 对话 → discussion 片段（合并间隔 ≤ 15 分钟的连续会话）
+  const MERGE_GAP_MS = 15 * 60 * 1000 // 15 分钟
+  const sorted = [...sessionMetas]
+    .filter(m => m.startTime)
+    .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())
+
+  const merged: Array<{
+    startTime: string; endTime: string
+    topics: string[]; conclusions: string[]; sessionIds: string[]
+  }> = []
+
+  for (const meta of sorted) {
+    const metaStart = new Date(meta.startTime).getTime()
+    const metaEnd = new Date(meta.endTime || meta.startTime).getTime()
+    const last = merged[merged.length - 1]
+
+    if (last) {
+      const lastEnd = new Date(last.endTime).getTime()
+      // 如果当前会话开始时间与上一段结束时间间隔 <= 15 分钟，则合并
+      if (metaStart - lastEnd <= MERGE_GAP_MS) {
+        last.endTime = meta.endTime || last.endTime
+        last.topics.push(meta.topic)
+        last.conclusions.push(meta.conclusion)
+        last.sessionIds.push(meta.sessionId)
+        continue
+      }
+    }
+    // 新片段
+    merged.push({
+      startTime: meta.startTime,
+      endTime: meta.endTime || meta.startTime,
+      topics: [meta.topic],
+      conclusions: [meta.conclusion],
+      sessionIds: [meta.sessionId]
+    })
+  }
+
+  for (const m of merged) {
+    const mergedTitle = m.topics.length === 1
+      ? m.topics[0]
+      : `连续 ${m.topics.length} 轮对话`
+    const mergedDesc = m.topics.length === 1
+      ? m.conclusions[0]
+      : m.topics.map((t, i) => `${i + 1}. ${t}`).join('\n')
+    insertStmt.run(
+      project.id, today, 'discussion',
+      mergedTitle.substring(0, 200),
+      mergedDesc.substring(0, 500),
+      m.startTime,
+      m.endTime,
+      m.sessionIds.join(',')
+    )
+  }
+
+  // 2. 代码变更 → coding 片段
+  for (const cc of codeChanges) {
+    const ts = cc.commitHash
+      ? new Date().toISOString() // CodeChange 无时间戳，用当前时间
+      : new Date().toISOString()
+    insertStmt.run(
+      project.id, today, 'coding',
+      cc.filePath.substring(0, 200),
+      cc.description || `${cc.changeType} (+${cc.linesAdded}/-${cc.linesRemoved})`,
+      ts,
+      new Date(new Date(ts).getTime() + 3600000).toISOString(), // +1小时
+      cc.commitHash || 'git'
+    )
+  }
+
+  // 3. 未解决问题 → debug 片段
+  if (reportContent.projects) {
+    for (const pr of reportContent.projects) {
+      for (const issue of pr.issues || []) {
+        if (!issue.isSolved) {
+          const now = new Date()
+          insertStmt.run(
+            project.id, today, 'debug',
+            issue.content.substring(0, 200),
+            issue.content.substring(0, 500),
+            new Date(now.getTime() - 3600000).toISOString(),
+            now.toISOString(),
+            'report'
+          )
+        }
+      }
+    }
+  }
 }
 
 // ==================== 辅助函数 ====================

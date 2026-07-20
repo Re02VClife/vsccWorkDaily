@@ -85,7 +85,7 @@ async function main() {
   console.log('[run-electron] 入口:', mainFile)
   console.log('[run-electron] 启动应用...\n')
 
-  const child = spawn(electronBin, [mainFile], {
+  const child = spawn(electronBin, ['-r', path.join(ROOT, 'scripts', 'electron-resolve-patch.cjs'), mainFile], {
     cwd: ROOT,
     stdio: 'inherit',
   })

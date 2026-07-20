@@ -1,7 +1,8 @@
-import { Card, Descriptions, Tag, Timeline, Typography, Empty, Spin } from '@arco-design/web-react'
-import { IconClockCircle, IconExclamationCircle, IconCheckCircle } from '@arco-design/web-react/icon'
+import { Card, Descriptions, Tag, Timeline, Typography, Empty, Spin, Button } from '@arco-design/web-react'
+import { IconClockCircle, IconExclamationCircle, IconCheckCircle, IconDown, IconUp } from '@arco-design/web-react/icon'
 import { useState, useEffect } from 'react'
-import type { ReportContent } from '../../shared/types'
+import type { ReportContent, WorkSnippet } from '../../shared/types'
+import GanttChart from './GanttChart'
 
 const { Text, Title } = Typography
 
@@ -13,6 +14,8 @@ export default function ReportPreview(_props: Props) {
   const [loading, setLoading] = useState(true)
   const [report, setReport] = useState<ReportContent | null>(null)
   const [balance, setBalance] = useState<string | null>(null)
+  const [projectSnippetMap, setProjectSnippetMap] = useState<Map<string, WorkSnippet[]>>(new Map())
+  const [ganttExpanded, setGanttExpanded] = useState(false)
 
   // 尝试从后端加载今日日报 + 余额
   useEffect(() => {
@@ -31,6 +34,19 @@ export default function ReportPreview(_props: Props) {
           if (content && content.overview) {
             setReport(content)
           }
+          // 加载甘特图片段（按项目分组）
+          const map = new Map<string, WorkSnippet[]>()
+          for (const r of reports) {
+            if (r.projectId && r.projectName) {
+              try {
+                const snips = await window.electronAPI.invoke('get-work-snippets', r.projectId, r.date) as WorkSnippet[]
+                if (snips.length > 0) {
+                  map.set(r.projectName, snips)
+                }
+              } catch { /* skip */ }
+            }
+          }
+          setProjectSnippetMap(map)
         }
         // 同时查询 DeepSeek 余额
         try {
@@ -95,6 +111,35 @@ export default function ReportPreview(_props: Props) {
           />
         </div>
       </Card>
+
+      {/* 甘特图 */}
+      {projectSnippetMap.size > 0 && (() => {
+        const totalCount = Array.from(projectSnippetMap.values()).reduce((s, v) => s + v.length, 0)
+        return (
+          <Card
+            style={{ marginBottom: 24 }}
+            title={
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span>📊 甘特图（{projectSnippetMap.size} 个项目 · {totalCount} 个片段 · 15分钟/格）</span>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={ganttExpanded ? <IconUp /> : <IconDown />}
+                  onClick={() => setGanttExpanded(!ganttExpanded)}
+                >
+                  {ganttExpanded ? '收起' : '展开'}
+                </Button>
+              </div>
+            }
+          >
+            {ganttExpanded ? (
+              <GanttChart projectMap={projectSnippetMap} />
+            ) : (
+              <Text type="secondary">共 {projectSnippetMap.size} 个项目、{totalCount} 个片段，点击展开查看甘特图</Text>
+            )}
+          </Card>
+        )
+      })()}
 
       {/* 各项目日报 */}
       {report.projects.map((project, idx) => (

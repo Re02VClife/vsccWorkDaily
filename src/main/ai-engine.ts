@@ -1,7 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk'
 import axios from 'axios'
 import { loadConfig } from './config'
-import type { ReportContent } from '../shared/types'
+import type { ReportContent, ManualInput } from '../shared/types'
 
 // ==================== API 客户端 ====================
 
@@ -33,7 +33,7 @@ function getApiPaths(config: ReturnType<typeof loadConfig>): string[] {
 
 interface AIMessage {
   role: 'user' | 'assistant'
-  content: string
+  content: string | any[]  // string for text-only, any[] for Anthropic multimodal
 }
 
 interface AIResponse {
@@ -72,7 +72,7 @@ async function callAI(
       model,
       max_tokens: options.maxTokens,
       temperature: options.temperature,
-      messages: messages.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
+      messages: messages.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content as any }))
     })
     const text = response.content
       .filter((b: any) => b.type === 'text')
@@ -181,6 +181,10 @@ const DAILY_REPORT_PROMPT = `你是一个工作日报助手。请根据以下信
 ## 用户编辑偏好（请参考这些编辑历史来调整描述的详细程度和风格）
 {editFeedback}
 
+## 用户手动补充的工作内容
+
+{manualInput}
+
 ## 预计算数据（JSON — 直接复制到对应的 report 字段，不要修改任何数值）
 {precomputedData}
 
@@ -260,6 +264,7 @@ export async function generateDailyReport(
   codeChanges: string,
   editFeedback: string,
   precomputedData?: string,
+  manualInput?: ManualInput,
   model?: string
 ): Promise<ReportContent> {
   const config = loadConfig()
@@ -311,16 +316,56 @@ export async function generateDailyReport(
     2
   )
 
+  // 构建手动输入文本
+  let manualInputText = '无'
+  if (manualInput && (manualInput.text.trim() || manualInput.images.length > 0)) {
+    const parts: string[] = []
+    if (manualInput.text.trim()) {
+      parts.push(`文字描述：\n${manualInput.text.trim()}`)
+    }
+    if (manualInput.images.length > 0) {
+      parts.push(`用户上传了 ${manualInput.images.length} 张参考图片，请结合图片内容理解用户的工作场景。`)
+    }
+    manualInputText = parts.join('\n\n')
+  }
+
   const prompt = DAILY_REPORT_PROMPT
     .replace('{projectContext}', projectContext)
     .replace('{conversationSummaries}', conversationSummaries)
     .replace('{codeChanges}', codeChanges)
     .replace('{editFeedback}', editFeedback || '无历史编辑记录')
+    .replace('{manualInput}', manualInputText)
     .replace('{precomputedData}', precomputedData || '{}')
     .replace('{reportSchema}', reportSchema)
 
+  // 构建消息：Anthropic 支持多模态图片
+  const apiType = detectApiType(config.apiKey)
+  let messages: { role: 'user' | 'assistant'; content: any }[]
+
+  if (apiType === 'anthropic' && manualInput?.images?.length) {
+    // Anthropic 多模态：text + image 混合 content
+    const contentBlocks: any[] = [{ type: 'text', text: prompt }]
+    for (const img of manualInput.images) {
+      // 解析 base64 data URI: data:image/png;base64,xxxxx
+      const match = img.match(/^data:(image\/\w+);base64,(.+)$/)
+      if (match) {
+        contentBlocks.push({
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: match[1],
+            data: match[2]
+          }
+        })
+      }
+    }
+    messages = [{ role: 'user', content: contentBlocks }]
+  } else {
+    messages = [{ role: 'user', content: prompt }]
+  }
+
   const response = await callAI(
-    [{ role: 'user', content: prompt }],
+    messages,
     { model: model || config.defaultModel, maxTokens: 32768, temperature: 0.5 }
   )
 

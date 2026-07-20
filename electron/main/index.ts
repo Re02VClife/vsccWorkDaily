@@ -6,11 +6,12 @@ import { generateReport } from '../../src/main/report-generator'
 import { scanRecentSessions, getClaudeProjectSlugs } from '../../src/main/jsonl-parser'
 import { scanCodeChanges } from '../../src/main/git-collector'
 import { chokidarWatcher } from '../../src/main/watcher'
-import type { AppConfig, ProjectConfig, DailyReport } from '../../src/shared/types'
+import type { AppConfig, ProjectConfig, DailyReport, ManualInput, WorkSnippet } from '../../src/shared/types'
 
 // 主窗口引用
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
+let isQuitting = false
 
 // ==================== 窗口管理 ====================
 
@@ -37,7 +38,7 @@ function createWindow(): void {
   // 关闭到托盘
   mainWindow.on('close', (event) => {
     const config = loadConfig()
-    if (config.closeToTray && !(app as any).isQuitting) {
+    if (config.closeToTray && !isQuitting) {
       event.preventDefault()
       mainWindow?.hide()
     }
@@ -69,7 +70,7 @@ function createTray(): void {
     {
       label: '退出',
       click: () => {
-        (app as any).isQuitting = true
+        isQuitting = true
         app.quit()
       }
     }
@@ -81,7 +82,7 @@ function createTray(): void {
 
 // ==================== 应用生命周期 ====================
 
-;(app as any).isQuitting = false
+isQuitting = false
 
 app.whenReady().then(() => {
   // 初始化数据库
@@ -108,7 +109,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
-  (app as any).isQuitting = true
+  isQuitting = true
   chokidarWatcher.stop()
   closeDatabase()
 })
@@ -174,15 +175,30 @@ ipcMain.handle('scan-code-changes', async (_event, projectPath: string, date: st
 })
 
 // ---- 日报生成 ----
-ipcMain.handle('generate-report', async (event, projectId?: number, chunkSize?: number) => {
+ipcMain.handle('generate-report', async (event, projectId?: number, chunkSize?: number, manualInput?: ManualInput, dateRange?: [string, string]) => {
   const sender = event.sender
-  const result = await generateReport(projectId, (msg: string) => {
-    try { sender.send('report-progress', msg) } catch {}
-  }, chunkSize || 100)
+  generateCancelled = false
+  const result = await generateReport(
+    projectId,
+    (msg: string) => {
+      try { sender.send('report-progress', msg) } catch {}
+    },
+    chunkSize || 100,
+    manualInput,
+    dateRange,
+    () => generateCancelled
+  )
   return {
     reports: result.reports,
     errors: result.errors
   }
+})
+
+// ---- 中断生成 ----
+let generateCancelled = false
+ipcMain.handle('cancel-generate', () => {
+  generateCancelled = true
+  return { success: true }
 })
 
 // ---- 日报 CRUD ----
@@ -367,6 +383,39 @@ ipcMain.handle('export-feishu', async (_event, reportJson?: string) => {
   }
 })
 
+// ---- 工作片段（甘特图） ----
+ipcMain.handle('get-work-snippets', (_event, projectId: number, date: string) => {
+  const db = getDatabase()
+  const rows = db.prepare(
+    'SELECT * FROM work_snippets WHERE project_id = ? AND date = ? ORDER BY start_time ASC'
+  ).all(projectId, date) as any[]
+  return rows.map(rowToSnippet)
+})
+
+// ---- 飞书多维表格导出（甘特图） ----
+ipcMain.handle('export-feishu-bitable', async (_event, projectId: number, date: string) => {
+  try {
+    const db = getDatabase()
+    const snippetRows = db.prepare(
+      'SELECT * FROM work_snippets WHERE project_id = ? AND date = ? ORDER BY start_time ASC'
+    ).all(projectId, date) as any[]
+    const snippets = snippetRows.map(rowToSnippet)
+
+    if (snippets.length === 0) {
+      return { success: false, error: '没有找到工作片段，请先生成日报' }
+    }
+
+    const projectRow = db.prepare('SELECT name FROM projects WHERE id = ?').get(projectId) as any
+    const projectName = projectRow?.name || '未知项目'
+
+    const { exportToFeishuBitable } = await import('../../src/main/feishu-exporter')
+    const result = await exportToFeishuBitable(snippets, projectName)
+    return { success: true, ...result }
+  } catch (e: any) {
+    return { success: false, error: e.message }
+  }
+})
+
 // ---- Markdown 导出 ----
 ipcMain.handle('export-markdown', async (_event, reportJson: string) => {
   const { markdownExporter } = await import('../../src/main/markdown-exporter')
@@ -417,5 +466,19 @@ function rowToReport(row: any): DailyReport {
     exportedFeishuBaseId: row.exported_feishu_base_id,
     createdAt: row.created_at,
     updatedAt: row.updated_at
+  }
+}
+
+function rowToSnippet(row: any): WorkSnippet {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    date: row.date,
+    snippetType: row.snippet_type,
+    title: row.title,
+    description: row.description || '',
+    startTime: row.start_time,
+    endTime: row.end_time,
+    source: row.source || ''
   }
 }

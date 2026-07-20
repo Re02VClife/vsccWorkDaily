@@ -1,5 +1,6 @@
 import axios from 'axios'
 import { loadConfig } from './config'
+import type { WorkSnippet } from '../shared/types'
 
 const FEISHU_API = 'https://open.feishu.cn/open-apis'
 
@@ -189,4 +190,109 @@ export async function exportToFeishu(reportJson: string): Promise<{ url: string;
 
   console.log('[feishu] 导出完成:', url)
   return { url, docId }
+}
+
+/**
+ * 导出工作片段到飞书多维表格（甘特图）
+ */
+export async function exportToFeishuBitable(
+  snippets: WorkSnippet[],
+  projectName: string
+): Promise<{ url: string; tableId: string }> {
+  const config = loadConfig()
+  if (!config.feishu.appId || !config.feishu.appSecret) {
+    throw new Error('飞书未配置，请在设置页面填写 App ID 和 App Secret')
+  }
+  if (!config.feishu.baseAppToken || !config.feishu.baseTableId) {
+    throw new Error('未配置飞书多维表格，请在设置页面填写 Base App Token 和 Table ID')
+  }
+
+  const token = await getAccessToken(config.feishu.appId, config.feishu.appSecret)
+  const { baseAppToken, baseTableId } = config.feishu
+  const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
+
+  // 1. 确保表格字段存在
+  console.log('[feishu-bitable] 确保表格字段...')
+  await ensureBitableFields(baseAppToken, baseTableId, token)
+
+  // 2. 映射片段到记录
+  const snippetTypeMap: Record<string, string> = {
+    coding: '编码',
+    discussion: '讨论',
+    debug: '调试',
+    docs: '文档'
+  }
+
+  const records = snippets.map(s => ({
+    fields: {
+      '工作内容': s.title?.substring(0, 300) || '',
+      '项目名称': projectName,
+      '开始时间': new Date(s.startTime).getTime(),
+      '结束时间': new Date(s.endTime).getTime(),
+      '工作类型': snippetTypeMap[s.snippetType] || s.snippetType,
+      '详细描述': s.description?.substring(0, 800) || '',
+      '状态': s.snippetType === 'debug' ? '卡住' : s.snippetType === 'discussion' ? '已完成' : '进行中'
+    }
+  }))
+
+  // 3. 批量插入（每批最多 500 条）
+  console.log('[feishu-bitable] 插入', records.length, '条记录...')
+  const res = await axios.post(
+    `${FEISHU_API}/bitable/v1/apps/${baseAppToken}/tables/${baseTableId}/records/batch_create`,
+    { records },
+    { headers, timeout: 30000 }
+  )
+
+  if (res.data.code !== 0) {
+    throw new Error(`插入记录失败(code=${res.data.code}): ${res.data.msg}`)
+  }
+
+  const url = `https://bytedance.feishu.cn/base/${baseAppToken}?table=${baseTableId}`
+  console.log('[feishu-bitable] 导出完成:', url)
+  return { url, tableId: baseTableId }
+}
+
+/**
+ * 确保多维表格中存在所需字段，缺失则创建
+ */
+async function ensureBitableFields(appToken: string, tableId: string, token: string): Promise<void> {
+  const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
+
+  // 列出已有字段
+  const listRes = await axios.get(
+    `${FEISHU_API}/bitable/v1/apps/${appToken}/tables/${tableId}/fields`,
+    { headers, timeout: 10000 }
+  )
+
+  if (listRes.data.code !== 0) {
+    console.warn('[feishu-bitable] 无法列出字段:', listRes.data.msg)
+    return // 跳过字段创建，直接尝试插入
+  }
+
+  const existingNames = new Set((listRes.data.data?.items || []).map((f: any) => f.field_name))
+
+  const neededFields = [
+    { field_name: '工作内容', type: 1 },
+    { field_name: '项目名称', type: 1 },
+    { field_name: '开始时间', type: 5 },   // datetime
+    { field_name: '结束时间', type: 5 },   // datetime
+    { field_name: '工作类型', type: 1 },
+    { field_name: '详细描述', type: 1 },
+    { field_name: '状态', type: 1 },
+  ]
+
+  for (const field of neededFields) {
+    if (!existingNames.has(field.field_name)) {
+      try {
+        await axios.post(
+          `${FEISHU_API}/bitable/v1/apps/${appToken}/tables/${tableId}/fields`,
+          field,
+          { headers, timeout: 10000 }
+        )
+        console.log('[feishu-bitable] 创建字段:', field.field_name)
+      } catch (e: any) {
+        console.warn('[feishu-bitable] 创建字段失败:', field.field_name, e.message)
+      }
+    }
+  }
 }
