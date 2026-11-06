@@ -66,7 +66,7 @@ async function callAI(
   if (type === 'anthropic') {
     // ===== Anthropic SDK =====
     if (!anthropicClient) {
-      anthropicClient = new Anthropic({ apiKey, baseURL: baseUrl || undefined })
+      anthropicClient = new Anthropic({ apiKey, baseURL: config.apiBaseUrl || undefined })
     }
     const response = await anthropicClient.messages.create({
       model,
